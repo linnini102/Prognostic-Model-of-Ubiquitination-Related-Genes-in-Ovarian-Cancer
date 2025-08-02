@@ -1,0 +1,131 @@
+#input library
+library(dplyr)
+library(rjson)
+library(ggvenn)
+library(dplyr)
+
+#load file
+tcga.clinical <- read.csv('/Volumes/TOSHIBA\ EXT/###/tcga/clinical.cart.2023-05-09/clinical.tsv',header=T,sep='\t')
+tcga.clinical <- dplyr::select(tcga.clinical,c('case_submitter_id','gender','age_at_index','vital_status','days_to_death','days_to_last_follow_up'))
+tcga.clinical <- tcga.clinical[duplicated(tcga.clinical),]
+rownames(tcga.clinical) <- tcga.clinical$case_submitter_id
+for (i in rownames(tcga.clinical)){
+	if (tcga.clinical[i,"days_to_death"]=="'--"){
+		tcga.clinical[i,"days_to_death"] <- tcga.clinical[i,"days_to_last_follow_up"]
+	}
+}
+tcga.clinical$days_to_last_follow_up <- NULL
+tcga.clinical <- filter(tcga.clinical,days_to_death != "'--")
+
+#load json file
+tcga.meta <- fromJSON(file='/Volumes/TOSHIBA\ EXT/###/tcga/metadata.cart.2023-05-09.json')
+tcga.data <- as.data.frame(matrix(NA,nrow=length(tcga.meta),ncol=3))
+colnames(tcga.data) <- c('sample.name','file.id','file.name')
+for (i in c(1:length(tcga.meta))){
+	tcga.data[i,'sample.name'] <- tcga.meta[[i]]$associated_entities[[1]]$entity_submitter_id
+	tcga.data[i,'file.id'] <- tcga.meta[[i]]$file_id
+	tcga.data[i,'file.name'] <- tcga.meta[[i]]$file_name
+}
+
+#load expression matrix
+unzip.file <- '/Volumes/TOSHIBA\ EXT/###/tcga/gdc_download_20230509_145335.477896'
+for (i in c(1:nrow(tcga.data))){
+	sample.count <- read.table(paste(unzip.file,tcga.data[i,'file.id'],tcga.data[i,'file.name'],sep='/'),skip=6,header=F,row.names=1)
+	if (i == 1){
+		tcga.count <- as.data.frame(sample.count$V8)
+	}else{
+		tcga.count <- cbind(tcga.count,as.data.frame(sample.count$V8))
+	}
+}
+rownames(tcga.count) <- rownames(sample.count)
+colnames(tcga.count) <- tcga.data[,1]
+
+#change gene id
+gene.anno <- sample.count[,c(1,2)]
+tcga.count <- cbind(gene.anno,tcga.count)
+fpkm.id.data <- tcga.count %>% group_by(V2) %>% summarise_at(vars(matches("TCGA")), mean) %>% as.data.frame()
+rownames(fpkm.id.data) <- fpkm.id.data$V2
+fpkm.id.data$V2 <- NULL
+
+#get unique tumor sample
+tumor.sample <- c()
+tumor.table <- data.frame()
+for (i in colnames(fpkm.id.data)){
+	tmp.list <- strsplit(i,'-')
+	if (startsWith(tmp.list[[1]][4],'0')){
+		tumor.sample <- c(tumor.sample,i)
+		tumor.table <- rbind(tumor.table,data.frame(ori=i,name=paste(tmp.list[[1]][1],tmp.list[[1]][2],tmp.list[[1]][3],sep='-')))
+	}
+}
+fpkm.id.data <- fpkm.id.data[,tumor.sample]
+tumor.table <- tumor.table[(table(tumor.table$name)==1),]
+fpkm.id.data <- fpkm.id.data[,tumor.table$ori]
+colnames(fpkm.id.data) <- tumor.table$name
+
+#union clinical
+rownames(tcga.clinical) <- tcga.clinical$case_submitter_id
+final.sample <- intersect(tcga.clinical$case_submitter_id,colnames(fpkm.id.data))
+fpkm.id.data <- fpkm.id.data[,final.sample]
+tcga.clinical <- tcga.clinical[final.sample,]
+tcga.data <- list(clinical=tcga.clinical,count=fpkm.id.data)
+saveRDS(tcga.data,"/Volumes/TOSHIBA\ EXT/###/tcga.rds")
+
+#de analysis
+library(edgeR)
+library(EnhancedVolcano)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(enrichplot)
+library(ggvenn)
+
+clinical <- read.table("/Volumes/TOSHIBA\ EXT/###/xena/TcgaTargetGTEX_phenotype.txt",header=T,sep='\t')
+clinical <- filter(clinical,X_primary_site=="Ovary"| X_primary_site=="Ovarian")
+clinical <- filter(clinical, X_sample_type=="Primary Tumor" | X_sample_type=="Normal Tissue")
+clinical$sample <- gsub("-",".",clinical$sample)
+
+count <- read.table("/Volumes/TOSHIBA\ EXT/###/xena/TcgaTargetGtex_RSEM_Hugo_norm_count",header=T,sep='\t',row.names=1)
+
+samples <- intersect(clinical$sample,colnames(count))
+
+clinical <- filter(clinical,sample %in% samples)
+tumor.sample <- filter(clinical,X_sample_type=='Primary Tumor')$sample
+normal.sample <- filter(clinical,X_sample_type=='Normal Tissue')$sample
+count <- count[,samples]
+count <- count[rowSums(is.na(count)) == 0,]
+count <- count[rowSums(count)>0,]
+
+count <- count[,clinical$sample]
+gs <- factor(clinical$X_sample_type)
+levels(gs) <- make.names(c("normal","tumor"))
+design <- model.matrix(~gs + 0)
+colnames(design) <- c('normal','tumor') 
+fit=lmFit(count,design) 
+df.matrix <- makeContrasts(normal - tumor , levels = design)
+fit2 <- contrasts.fit(fit, df.matrix )
+fit2=eBayes(fit2)
+de.result <- topTable(fit2, coef = 1, adjust.method = "BH", number = Inf)
+
+EnhancedVolcano(de.result,lab=rownames(de.result),x="logFC",y="adj.P.Val",pCutoff=0.01,FCcutoff=1,title="TCGA Gtex",subtitle="normal VS tumor")
+
+genename <- as.character(rownames(de.result))
+gene_map <- mapIds(org.Hs.eg.db, genename, 'ENTREZID', 'SYMBOL')
+geneList <- de.result$logFC
+names(geneList) <- gene_map
+geneList<-na.omit(geneList)
+geneList = geneList[order(geneList,decreasing = TRUE)]
+#GO gsea
+GO <- gseGO(
+  geneList, #gene_fc
+  ont = "ALL",
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+)
+gseaplot2(GO, c(35,38,49,67,116), pvalue_table = TRUE)
+
+sig.gene <- de.result %>% filter(abs(logFC)>1 & adj.P.Val<0.05) %>% rownames()
+genes <- read.table("/Volumes/TOSHIBA\ EXT/###/genes.txt",header=T)$V1
+x <- list(sig.de.gene=sig.gene,ubi.gene=genes)
+ggvenn(x,show_percentage=F)

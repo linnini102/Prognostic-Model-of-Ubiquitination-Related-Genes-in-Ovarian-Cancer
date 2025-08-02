@@ -1,0 +1,201 @@
+#load library
+library(dplyr)
+library(survival)
+library(survminer)
+library(gridExtra)
+library(glmnet)
+library(timeROC)
+library(hdnom)
+library(patchwork)
+
+#load files
+genes <- readRDS("/Volumes/TOSHIBA\ EXT/###/union_gene.rds")
+tcga <- readRDS("/Volumes/TOSHIBA\ EXT/###/tcga.rds")
+genes <- intersect(genes,rownames(tcga[[2]]))
+
+survival.data <- tcga[[1]][,c('days_to_death','vital_status')]
+survival.count <- t(tcga[[2]][genes,rownames(tcga[[1]])])
+survival.data <- cbind(survival.data,survival.count)
+survival.data$days_to_death <- as.numeric(survival.data$days_to_death)
+survival.data$vital_status <- ifelse(survival.data$vital_status=='Dead',1,0)
+
+survival.result <- data.frame()
+for (i in genes){
+	model <- coxph(Surv(days_to_death, vital_status) ~ survival.data[,i],data=survival.data)
+	model.summary <- summary(model)
+	survival.result <- rbind(survival.result,cbind(id=i,
+		HR = model.summary$conf.int[,"exp(coef)"],
+		Hr.95L = model.summary$conf.int[,"lower .95"],
+		Hr.95H = model.summary$conf.int[,"upper .95"],
+		p.value = model.summary$coefficients[,"Pr(>|z|)"]
+		))
+}
+
+final.sig.gene <- subset(survival.result,subset=p.value<0.06)$id
+forest.plot <- head(survival.result[order(survival.result$p.value),],n=6)
+forest.plot$HR <- round(as.numeric(forest.plot$HR),4)
+forest.plot$Hr.95L <- as.numeric(forest.plot$Hr.95L)
+forest.plot$Hr.95H <- as.numeric(forest.plot$Hr.95H)
+forest.plot$CI <- paste(round(forest.plot$Hr.95L,4),round(forest.plot$Hr.95H,4),sep=', ')
+forest.plot$p.value <- round(as.numeric(forest.plot$p.value),8)
+forest.plot$index <- c(1:6)
+
+plot1 <- ggplot(forest.plot, aes(y = index, x = HR)) +
+  geom_point(shape = 18, size = 5) +  
+  geom_errorbarh(aes(xmin = Hr.95L, xmax = Hr.95H), height = 0.25) +
+  geom_vline(xintercept = 1, color = "red", linetype = "dashed", cex = 1, alpha = 0.5) +
+  scale_y_continuous(name = "", breaks=1:6, labels = forest.plot$id, trans = "reverse") +
+  xlab(" ") + 
+  ylab(" ") + 
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black"),
+        axis.text.y = element_text(size = 12, colour = "black"),
+        axis.text.x.bottom = element_text(size = 12, colour = "black"),
+        axis.title.x = element_text(size = 12, colour = "black"))
+
+table_base <- ggplot(forest.plot, aes(y=id)) +
+  ylab(NULL) + xlab("  ") + 
+  theme(plot.title = element_text(hjust = 0.5, size=12), 
+        axis.text.x = element_text(color="white", hjust = -3, size = 25),
+        axis.line = element_blank(),
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(),
+        axis.title.y = element_blank(), 
+        legend.position = "none",
+        panel.background = element_blank(), 
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        plot.background = element_blank())
+
+tab1 <- table_base + 
+  labs(title = "space") +
+  geom_text(aes(y = rev(index), x = 1, label = HR), size = 4) +
+  ggtitle("HR")
+
+tab2 <- table_base +
+  geom_text(aes(y = rev(index), x = 1, label = CI), size = 4) + 
+  ggtitle("95% CI")
+
+tab3 <- table_base +
+  geom_text(aes(y = rev(index), x = 1, label = p.value), size = 4) + 
+  ggtitle("P Value")
+
+lay <-  matrix(c(1,1,1,1,1,1,1,1,1,1,2,2,2,3,3,4,4), nrow = 1)
+grid.arrange(plot1, tab1, tab2, tab3, layout_matrix = lay)
+
+#lasso
+tcga.clinical <- tcga[[1]]
+tcga.count <- tcga[[2]]
+tcga.clinical$days_to_death <- as.numeric(tcga.clinical$days_to_death)/365
+tcga.clinical$vital_status <- ifelse(tcga.clinical$vital_status=='Dead',1,0)
+x <- as.matrix(t(tcga.count[final.sig.gene,]))
+y <- data.matrix(Surv(tcga.clinical$days_to_death,tcga.clinical$vital_status))
+set.seed(56)
+fit <- glmnet(x,y,family='cox',maxit=10000)
+set.seed(56)
+cvfit <- cv.glmnet(x,y,family="cox",maxit=10000,nfole=5,type.measure='deviance')
+plot(fit)
+plot(cvfit)
+
+coef <- coef(fit,s=cvfit$lambda.min)
+index <- which(coef!=0)
+actCoef <- coef[index]
+lassoGene <- row.names(coef)[index]
+geneCoef <- cbind(Gene=lassoGene,Coef=actCoef)
+tcga.clinical$risk_score <- 0
+for (i in rownames(tcga.clinical)){
+        rs = 0
+        for (j in c(1:nrow(geneCoef))){
+            gene <- geneCoef[j,1]
+            rs = rs+as.numeric(geneCoef[j,2])*as.numeric(tcga.count[gene,i])
+        }
+        tcga.clinical[i,'risk_score'] <- rs
+}
+
+#grouping
+tcga.clinical$group <- ifelse(tcga.clinical$risk_score > median(tcga.clinical$risk_score), "high", "low")
+rs.curve <- tcga.clinical[order(tcga.clinical$risk_score),]
+riskClass <- rs.curve[,'group']
+lowLength <- length(riskClass[riskClass=='low'])
+highLength <- length(riskClass[riskClass=='high'])
+lowMax <- max(rs.curve$risk_score[riskClass=='low'])
+line <- rs.curve[,'risk_score']
+plot(line,type='p',pch=20,xlab='Patients (increasing risk score)', 
+     ylab="Risk score",col=c(rep('blue',lowLength),rep("red",highLength)))
+abline(h=lowMax,v=lowLength,lty=2)
+legend("topleft",c("High risk","low Risk"),bty='n',pch=19,col=c("red","blue"),cex=1.2)
+
+#»æÖÆÉú´æ×´Ì¬
+color <- as.vector(rs.curve$vital_status)
+color[color==1] = "red"
+color[color==0] = "blue"
+plot(as.numeric(rs.curve$days_to_death),pch=19,
+     xlab="Patients (increasing risk score)", ylab="Survival time (years)",col=color)
+abline(v=lowLength,lty=2)
+legend("topleft",c("Dead","Alive"),bty='n',pch=19,col=c("red","blue"),cex=1.2)
+
+#surcurve
+diff <- survdiff(Surv(days_to_death,as.numeric(vital_status))~group,data=tcga.clinical)
+p.value <- 1-pchisq(diff$chisq,df=1)
+p.value <- signif(p.value,4)
+p.value <- format(p.value,scientific=T)
+fit <- survfit(Surv(days_to_death,as.numeric(vital_status))~group, data=tcga.clinical)
+ggsurvplot(fit,data=tcga.clinical,conf.int=T,pval=paste0("p<0.001"),
+                     pval.size=5,legend.title="Risk",
+                     legend.labs=c("high risk", "low risk"),
+                     xlab="Time(years)",break.time.by=1,
+                     palette=c("red","blue"),
+                     risk.table.title="",risk.table.height=.25,
+                     risk.table = TRUE)
+
+
+roc <- timeROC(T=tcga.clinical$days_to_death,delta=tcga.clinical$vital_status,marker=tcga.clinical$risk_score,
+              cause=1,weighting='aalen',times=c(.8,2.5,5),ROC=T)
+plot(roc,time=.8,col='green',title=F,lwd=2)
+plot(roc,time=2.5,col='blue',add=T,title=F,lwd=2)
+plot(roc,time=5,col='red',add=T,title=F,lwd=2)
+legend('bottomright',
+      c(paste0('AUC at 1 years: ',sprintf("%.03f",roc$AUC[1])),
+       paste0('AUC at 3 years: ',sprintf("%.03f",roc$AUC[2])),
+       paste0('AUC at 5 years: ',sprintf("%.03f",roc$AUC[3]))),
+      col=c("green","blue","red"),lwd=2,bty='n')
+
+fit <- fit_aenet(x, y, nfolds = 3, rule = "lambda.1se", seed = c(5,7))
+
+model <- fit$model
+alpha <- fit$alpha
+lambda <- fit$lambda
+adapen <- fit$pen_factor
+cal_int1 <- calibrate(
+  x, tcga.clinical$days_to_death, tcga.clinical$vital_status,
+  model.type = "aenet",
+  alpha = alpha, lambda = lambda, pen.factor = adapen,
+  method = "bootstrap", boot.times = 10,
+  pred.at = 1, ngroup = 3,
+  seed = 42, trace = FALSE
+)
+p1 <- plot(cal_int1, xlim = c(0.6, 1), ylim = c(0.6, 1), title="One year calibration")
+cal_int2 <- calibrate(
+  x, tcga.clinical$days_to_death, tcga.clinical$vital_status,
+  model.type = "aenet",
+  alpha = alpha, lambda = lambda, pen.factor = adapen,
+  method = "bootstrap", boot.times = 10,
+  pred.at = 3, ngroup = 3,
+  seed = 42, trace = FALSE
+)
+p2 <- plot(cal_int2, xlim = c(0.6, 1), ylim = c(0.6, 1), main="Three year calibration")
+cal_int3 <- calibrate(
+  x, tcga.clinical$days_to_death, tcga.clinical$vital_status,
+  model.type = "aenet",
+  alpha = alpha, lambda = lambda, pen.factor = adapen,
+  method = "bootstrap", boot.times = 10,
+  pred.at = 5, ngroup = 3,
+  seed = 42, trace = FALSE
+)
+p3 <- plot(cal_int3, xlim = c(0.6, 1), ylim = c(0.6, 1), main="Five year calibration")
+p1+p2+p3

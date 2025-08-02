@@ -1,0 +1,131 @@
+#load library
+library(dplyr)
+library(survival)
+library(survminer)
+library(gridExtra)
+library(hdnom)
+library(timeROC)
+library(GEOquery)
+library(impute)
+library(readxl)
+library(limma)
+
+#load files
+tcga <- readRDS("/Volumes/TOSHIBA\ EXT/###/tcga.rds")
+
+#load geo data
+eSet <- getGEO('GSE165808',AnnotGPL = F,getGPL = F)
+geo.sample <- pData(eSet[[1]])
+geo.sample <- geo.sample %>% dplyr::select(c("title","overall-survival_days:ch1", "live/dead:ch1"))
+rownames(geo.sample) <- geo.sample$title
+colnames(geo.sample) <- c("sample","days_to_death","vital_status")
+geo.sample$days_to_death <- as.numeric(geo.sample$days_to_death)/365
+geo.sample$vital_status <- ifelse(geo.sample$vital_status=='live',0,1)
+
+count <- read.table("/Volumes/TOSHIBA\EXT/###/geo/GSE165808_hgsc_tpm.tsv",header=T,row.names=1,quote='"')
+rownames(count) <- unlist(lapply(rownames(count) , function(x) strsplit(x, '[|]')[[1]][1]))
+
+geneCoef <- readRDS("/Volumes/TOSHIBA\ EXT/###/geneCoef.rds")
+geo.sample$risk_score <- 0
+for (i in rownames(geo.sample)){
+        rs = 0
+        for (j in c(1:nrow(geneCoef))){
+            gene <- geneCoef[j,1]
+            rs = rs+as.numeric(geneCoef[j,2])*as.numeric(count[gene,i])
+        }
+        geo.sample[i,'risk_score'] <- rs
+}
+geo.sample <- filter(geo.sample,days_to_death>0.5)
+
+#grouping
+geo.sample$group <- ifelse(geo.sample$risk_score > median(geo.sample$risk_score), "high", "low")
+rs.curve <- geo.sample[order(geo.sample$risk_score),]
+riskClass <- rs.curve[,'group']
+lowLength <- length(riskClass[riskClass=='low'])
+highLength <- length(riskClass[riskClass=='high'])
+lowMax <- max(rs.curve$risk_score[riskClass=='low'])
+line <- rs.curve[,'risk_score']
+plot(line,type='p',pch=20,xlab='Patients (increasing risk score)', 
+     ylab="Risk score",col=c(rep('blue',lowLength),rep("red",highLength)))
+abline(h=lowMax,v=lowLength,lty=2)
+legend("topleft",c("High risk","low Risk"),bty='n',pch=19,col=c("red","blue"),cex=1.2)
+
+#»æÖÆÉú´æ×´Ì¬
+color <- as.vector(rs.curve$vital_status)
+color[color==1] = "red"
+color[color==0] = "blue"
+plot(as.numeric(rs.curve$days_to_death),pch=19,
+     xlab="Patients (increasing risk score)", ylab="Survival time (years)",col=color)
+abline(v=lowLength,lty=2)
+legend("topleft",c("Dead","Alive"),bty='n',pch=19,col=c("red","blue"),cex=1.2)
+
+#surcurve
+diff <- survdiff(Surv(days_to_death,as.numeric(vital_status))~group,data=geo.sample)
+p.value <- 1-pchisq(diff$chisq,df=0.1)
+p.value <- signif(p.value,4)
+p.value <- format(p.value,scientific=T)
+fit <- survfit(Surv(days_to_death,as.numeric(vital_status))~group, data=geo.sample)
+ggsurvplot(fit,data=geo.sample,conf.int=T,pval=paste0("p = ",p.value),
+                     pval.size=5,legend.title="Risk",
+                     legend.labs=c("high risk", "low risk"),
+                     xlab="Time(years)",break.time.by=1,
+                     palette=c("red","blue"),
+                     risk.table.title="",risk.table.height=.25,
+                     risk.table = TRUE)
+
+roc <- timeROC(T=geo.sample$days_to_death,delta=geo.sample$vital_status,marker=geo.sample$risk_score,
+              cause=1,weighting='aalen',times=c(1.5,2.9,3.5),ROC=T)
+plot(roc,time=1.5,col='green',title=F,lwd=2)
+plot(roc,time=2.9,col='blue',add=T,title=F,lwd=2)
+plot(roc,time=3.5,col='red',add=T,title=F,lwd=2)
+legend('bottomright',
+      c(paste0('AUC at 1 years: ',sprintf("%.03f",roc$AUC[1])),
+       paste0('AUC at 3 years: ',sprintf("%.03f",roc$AUC[2])),
+       paste0('AUC at 5 years: ',sprintf("%.03f",roc$AUC[3]))),
+      col=c("green","blue","red"),lwd=2,bty='n')
+
+#extract gene
+protein.count<-read.table('/Volumes/TOSHIBA\EXT/###/protein/CPTAC2_Ovarian_Prospective_Collection_PNNL_Proteome.tmt10.tsv',header=T,sep='\t',row.names=1)
+keeped.col <- data.frame()
+for (i in colnames(protein.count)){
+  tmp <- strsplit(i,split='[.]')
+  if (tail(tmp[[1]],n=3)[1]=='Unshared'){
+    keeped.col <- rbind(keeped.col,data.frame(ori=i,after=tmp[[1]][1]))
+  }
+}
+protein.count <- protein.count[,c(keeped.col$ori)]
+colnames(protein.count) <- gsub("[.]Unshared[.]Log[.]Ratio","",colnames(protein.count))
+
+#load protein info
+protein.info<-read.table('/Volumes/TOSHIBA\EXT/###/protein/PDC_biospecimen_manifest_06132023_084124.tsv',header=T,sep='\t')
+protein.info$sample <- gsub('-','.',protein.info$Aliquot.Submitter.ID)
+for (i in 1:nrow(protein.info)){
+  tmp <- protein.info[i,"sample"]
+  if (substring(tmp, 1,1) %in% c(0:9)){
+    protein.info[i,"sample"] <- paste0("X",protein.info[i,"sample"])
+  }
+}
+
+protein.info <- protein.info[,c("sample",'Sample.Type')]
+rownames(protein.info) <- protein.info$sample
+colnames(protein.info) <- c('sample','type')
+protein.info$type <- ifelse(protein.info$type=="Primary Tumor","Tumor","Normal")
+samples <- intersect(colnames(protein.count),rownames(protein.info))
+protein.info <- protein.info[samples,]
+protein.count <- protein.count[,samples]
+
+gene.used <- intersect(geneCoef[,1],rownames(protein.count))
+protein.ana <- cbind(protein.info[colnames(protein.count),],t(protein.count[gene.used,]))
+plot <- data.frame()
+for (i in gene.used){
+    tmp <- protein.ana[,c(i,'type')]
+    tmp$protein <- i
+    colnames(tmp) <- c('V1','group','V3')
+    plot <- rbind(plot,tmp)
+}
+
+ggboxplot(plot,x="V3",y="V1",color="group",
+         ylab="Normalized Expression",add="none",xlab='',palette=c("blue","red"))+
+    rotate_x_text(50)+
+    stat_compare_means(aes(group=group),symnum.args=list(cutpoints=c(0,0.001,0.01,0.05,1),symbol=c("***","**","*","ns")),label = "p.signif")
+
