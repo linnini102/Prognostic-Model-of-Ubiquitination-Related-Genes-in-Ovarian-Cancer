@@ -1,0 +1,18 @@
+library (ggpubr)
+tcga <-  readRDS("/Volumes/Untitled/tcga_clinical.rds     ")
+score <-  read.table( "/Volumes/Untitled/20250412/estimate.txt",  header=T,sep='\t')
+union <-  intersect(rownames(tcga),score $ID)
+tcga <-  tcga[union,]
+rownames (score)     <-    make.unique   (score   $ID)
+
+tcga <-  cbind(tcga,score)
+tiff  ("/Volumes/Untitled/20250412/plot/stromal.tiff",      width=1200,height=1800,res=300)
+ggboxplot(tcga,x="group",y="Stromal_score",color= "group",
+ylab="Stromal      score",add="none",xlab='',palette=c("red","blue"))+
+
+
+tcga$group <-  ifelse  (tcga$group=="low","high","low")
+tcga$group <- factor (tcga$group,levels =c("low","high"))
+
+¡¡¡¡¡¡ylab="Immune score",add="none",xlab='',palette=c("red","blue"))+ rotate_x_text (50)+
+stat_compare_means(aes(group=group),symnum args=List(cutpoints=c(0,0.001,0.01,0.05,1),symbol=c("**¡±,¡±**¡±,"*,"ns")),1
